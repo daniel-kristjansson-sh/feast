@@ -183,3 +183,130 @@ class TestRegistryWriteMethodsWrapped:
             assert hasattr(method, "__wrapped__"), (
                 f"Registry.{method_name} is not wrapped with cas_retry"
             )
+
+
+class TestGCSRegistryStoreCAS:
+    """Tests for GCSRegistryStore generation capture and if_generation_match."""
+
+    @pytest.fixture
+    def mock_gcs_store(self):
+        from feast.infra.registry.gcs import GCSRegistryStore
+
+        store = GCSRegistryStore.__new__(GCSRegistryStore)
+        store._bucket = "test-bucket"
+        store._blob = "registry.db"
+        store._uri = MagicMock()
+        store._uri.geturl.return_value = "gs://test-bucket/registry.db"
+        store._expected_generation = None
+        store.gcs_client = MagicMock()
+        return store
+
+    def test_get_registry_proto_captures_generation(self, mock_gcs_store):
+        proto = RegistryProto()
+        proto.registry_schema_version = "1"
+
+        mock_bucket = MagicMock()
+        mock_gcs_store.gcs_client.get_bucket.return_value = mock_bucket
+
+        mock_blob = MagicMock()
+        mock_blob.generation = 12345
+        mock_blob.exists.return_value = True
+        mock_blob.download_to_file.side_effect = lambda f: f.write(
+            proto.SerializeToString()
+        )
+
+        with patch("google.cloud.storage.Blob", return_value=mock_blob):
+            result = mock_gcs_store.get_registry_proto()
+
+        assert result.registry_schema_version == "1"
+        assert mock_gcs_store._expected_generation == 12345
+
+    def test_write_registry_passes_if_generation_match(self, mock_gcs_store):
+        mock_gcs_store._expected_generation = 12345
+        mock_bucket = MagicMock()
+        mock_gcs_store.gcs_client.get_bucket.return_value = mock_bucket
+        mock_blob = MagicMock()
+        mock_blob.generation = 67890
+        mock_bucket.blob.return_value = mock_blob
+
+        proto = RegistryProto()
+        mock_gcs_store._write_registry(proto)
+
+        call_kwargs = mock_blob.upload_from_file.call_args
+        assert call_kwargs.kwargs["if_generation_match"] == 12345
+
+
+class TestAzBlobRegistryStoreCAS:
+    """Tests for AzBlobRegistryStore ETag capture and if_match."""
+
+    @pytest.fixture
+    def mock_azure_store(self):
+        from feast.infra.registry.contrib.azure.azure_registry_store import (
+            AzBlobRegistryStore,
+        )
+
+        store = AzBlobRegistryStore.__new__(AzBlobRegistryStore)
+        store._container = "test-container"
+        store._path = "registry.db"
+        store._uri = MagicMock()
+        store._uri.geturl.return_value = (
+            "https://test.blob.core.windows.net/test-container/registry.db"
+        )
+        store._expected_etag = None
+        store.blob = MagicMock()
+        return store
+
+    def test_get_registry_proto_captures_etag(self, mock_azure_store):
+        proto = RegistryProto()
+        proto.registry_schema_version = "1"
+
+        mock_azure_store.blob.exists.return_value = True
+        mock_download = MagicMock()
+        mock_download.properties.etag = '"abc123"'
+        mock_download.readall.return_value = proto.SerializeToString()
+        mock_azure_store.blob.download_blob.return_value = mock_download
+
+        result = mock_azure_store.get_registry_proto()
+        assert result.registry_schema_version == "1"
+        assert mock_azure_store._expected_etag == '"abc123"'
+
+    def test_write_registry_passes_if_match(self, mock_azure_store):
+        mock_azure_store._expected_etag = '"abc123"'
+        mock_upload = MagicMock()
+        mock_upload.etag = '"def456"'
+        mock_azure_store.blob.upload_blob.return_value = mock_upload
+
+        proto = RegistryProto()
+        mock_azure_store._write_registry(proto)
+
+        call_kwargs = mock_azure_store.blob.upload_blob.call_args
+        assert call_kwargs.kwargs["if_match"] == '"abc123"'
+        assert mock_azure_store._expected_etag == '"def456"'
+
+    def test_write_registry_without_etag_passes_none(self, mock_azure_store):
+        mock_azure_store._expected_etag = None
+        mock_upload = MagicMock()
+        mock_upload.etag = '"def456"'
+        mock_azure_store.blob.upload_blob.return_value = mock_upload
+
+        proto = RegistryProto()
+        mock_azure_store._write_registry(proto)
+
+        call_kwargs = mock_azure_store.blob.upload_blob.call_args
+        assert call_kwargs.kwargs["if_match"] is None
+
+    def test_write_registry_raises_cas_conflict_on_resource_modified(
+        self, mock_azure_store
+    ):
+        from feast.infra.registry.contrib.azure.azure_registry_store import (
+            ResourceModifiedError,
+        )
+
+        mock_azure_store._expected_etag = '"abc123"'
+        mock_azure_store.blob.upload_blob.side_effect = ResourceModifiedError(
+            "The blob has been modified"
+        )
+
+        proto = RegistryProto()
+        with pytest.raises(RegistryCASConflictError):
+            mock_azure_store._write_registry(proto)
