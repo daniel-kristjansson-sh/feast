@@ -5101,33 +5101,36 @@ def _validate_data_sources(data_sources: List[DataSource]):
 # surface on the final commit(). That commit has no mutation to replay, so
 # the entire apply sequence must be re-run on conflict. All operations are
 # idempotent, so this is safe.
-
-_CAS_MAX_RETRIES = 5
-_CAS_BASE_BACKOFF = 0.1
-_CAS_MAX_BACKOFF = 5.0
+#
+# Retry parameters are read from the underlying registry instance, which
+# gets them from RegistryConfig in feature_store.yaml.
 
 _apply_original = FeatureStore.apply
 
 
 def _apply_with_cas_retry(self, *args, **kwargs):
-    for attempt in range(_CAS_MAX_RETRIES):
+    registry = self._registry
+    max_retries = getattr(registry, "cas_max_retries", 5)
+    base_backoff = getattr(registry, "cas_base_backoff", 0.1)
+    max_backoff = getattr(registry, "cas_max_backoff", 5.0)
+    for attempt in range(max_retries):
         try:
             return _apply_original(self, *args, **kwargs)
         except RegistryCASConflictError:
-            if attempt < _CAS_MAX_RETRIES - 1:
-                backoff = min(_CAS_BASE_BACKOFF * (2**attempt), _CAS_MAX_BACKOFF)
+            if attempt < max_retries - 1:
+                backoff = min(base_backoff * (2**attempt), max_backoff)
                 _logger.warning(
                     "Registry CAS conflict during apply (attempt %d/%d), "
                     "retrying in %.2fs",
                     attempt + 1,
-                    _CAS_MAX_RETRIES,
+                    max_retries,
                     backoff,
                 )
                 time.sleep(backoff)
             else:
                 _logger.error(
                     "Registry CAS conflict during apply: max retries (%d) exceeded",
-                    _CAS_MAX_RETRIES,
+                    max_retries,
                 )
                 raise
     return None  # unreachable

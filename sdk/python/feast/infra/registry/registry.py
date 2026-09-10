@@ -188,10 +188,15 @@ def get_registry_store_class_from_scheme(registry_path: str):
 # The mutations are idempotent: re-applying the same entity / FV / interval
 # to a fresh proto produces the correct state because the first write was
 # never persisted (that's why S3 returned 412).
+#
+# Retry parameters are read from the Registry instance (self.cas_max_retries,
+# self.cas_base_backoff, self.cas_max_backoff) which are set from
+# RegistryConfig in feature_store.yaml. Defaults are used when the Registry
+# is constructed without a config (e.g. clone()).
 
-_CAS_MAX_RETRIES = 5
-_CAS_BASE_BACKOFF = 0.1
-_CAS_MAX_BACKOFF = 5.0
+_CAS_DEFAULT_MAX_RETRIES = 5
+_CAS_DEFAULT_BASE_BACKOFF = 0.1
+_CAS_DEFAULT_MAX_BACKOFF = 5.0
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -199,18 +204,21 @@ F = TypeVar("F", bound=Callable[..., Any])
 def cas_retry(func: F) -> F:
     @wraps(func)
     def wrapper(self, *args, **kwargs):
-        for attempt in range(_CAS_MAX_RETRIES):
+        max_retries = getattr(self, "cas_max_retries", _CAS_DEFAULT_MAX_RETRIES)
+        base_backoff = getattr(self, "cas_base_backoff", _CAS_DEFAULT_BASE_BACKOFF)
+        max_backoff = getattr(self, "cas_max_backoff", _CAS_DEFAULT_MAX_BACKOFF)
+        for attempt in range(max_retries):
             try:
                 return func(self, *args, **kwargs)
             except RegistryCASConflictError:
-                if attempt < _CAS_MAX_RETRIES - 1:
-                    backoff = min(_CAS_BASE_BACKOFF * (2**attempt), _CAS_MAX_BACKOFF)
+                if attempt < max_retries - 1:
+                    backoff = min(base_backoff * (2**attempt), max_backoff)
                     logger.warning(
                         "Registry CAS conflict on %s (attempt %d/%d), "
                         "retrying in %.2fs",
                         func.__name__,
                         attempt + 1,
-                        _CAS_MAX_RETRIES,
+                        max_retries,
                         backoff,
                     )
                     time.sleep(backoff)
@@ -218,7 +226,7 @@ def cas_retry(func: F) -> F:
                     logger.error(
                         "Registry CAS conflict on %s: max retries (%d) exceeded",
                         func.__name__,
-                        _CAS_MAX_RETRIES,
+                        max_retries,
                     )
                     raise
         return None  # unreachable
@@ -303,6 +311,20 @@ class Registry(BaseRegistry):
 
         self.cache_mode = (
             registry_config.cache_mode if registry_config is not None else "sync"
+        )
+
+        self.cas_max_retries = (
+            registry_config.cas_max_retries if registry_config is not None else 5
+        )
+        self.cas_base_backoff = (
+            registry_config.cas_base_backoff_seconds
+            if registry_config is not None
+            else 0.1
+        )
+        self.cas_max_backoff = (
+            registry_config.cas_max_backoff_seconds
+            if registry_config is not None
+            else 5.0
         )
 
         self._file_mtime = None
