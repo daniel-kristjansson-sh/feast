@@ -175,6 +175,57 @@ def get_registry_store_class_from_scheme(registry_path: str):
         return get_registry_store_class_from_type(registry_store_type)
 
 
+# ---------------------------------------------------------------------------
+# CAS retry support
+# ---------------------------------------------------------------------------
+# When the registry store is an S3RegistryStore (which uses If-Match/ETag
+# conditional writes), commit() may raise RegistryCASConflictError (S3 412
+# PreconditionFailed). The cas_retry decorator re-invokes the entire method
+# so that _prepare_registry_for_changes at the top of each method re-reads a
+# fresh proto from S3, the mutation is re-applied, and commit() retries with
+# the new ETag.
+#
+# The mutations are idempotent: re-applying the same entity / FV / interval
+# to a fresh proto produces the correct state because the first write was
+# never persisted (that's why S3 returned 412).
+
+_CAS_MAX_RETRIES = 5
+_CAS_BASE_BACKOFF = 0.1
+_CAS_MAX_BACKOFF = 5.0
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def cas_retry(func: F) -> F:
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        for attempt in range(_CAS_MAX_RETRIES):
+            try:
+                return func(self, *args, **kwargs)
+            except RegistryCASConflictError:
+                if attempt < _CAS_MAX_RETRIES - 1:
+                    backoff = min(_CAS_BASE_BACKOFF * (2**attempt), _CAS_MAX_BACKOFF)
+                    logger.warning(
+                        "Registry CAS conflict on %s (attempt %d/%d), "
+                        "retrying in %.2fs",
+                        func.__name__,
+                        attempt + 1,
+                        _CAS_MAX_RETRIES,
+                        backoff,
+                    )
+                    time.sleep(backoff)
+                else:
+                    logger.error(
+                        "Registry CAS conflict on %s: max retries (%d) exceeded",
+                        func.__name__,
+                        _CAS_MAX_RETRIES,
+                    )
+                    raise
+        return None  # unreachable
+
+    return wrapper  # type: ignore[return-value]
+
+
 class Registry(BaseRegistry):
     def apply_user_metadata(
         self,
@@ -331,6 +382,7 @@ class Registry(BaseRegistry):
         new_registry._registry_store = NoopRegistryStore()
         return new_registry
 
+    @cas_retry
     def update_infra(self, infra: Infra, project: str, commit: bool = True):
         self._prepare_registry_for_changes(project)
         assert self.cached_registry_proto
@@ -345,6 +397,7 @@ class Registry(BaseRegistry):
         )
         return Infra.from_proto(registry_proto.infra)
 
+    @cas_retry
     def apply_entity(self, entity: Entity, project: str, commit: bool = True):
         entity.is_valid()
 
@@ -398,6 +451,7 @@ class Registry(BaseRegistry):
         )
         return proto_registry_utils.list_data_sources(registry_proto, project, tags)
 
+    @cas_retry
     def apply_data_source(
         self, data_source: DataSource, project: str, commit: bool = True
     ):
@@ -440,6 +494,7 @@ class Registry(BaseRegistry):
         if commit:
             self.commit()
 
+    @cas_retry
     def delete_data_source(self, name: str, project: str, commit: bool = True):
         self._prepare_registry_for_changes(project)
         assert self.cached_registry_proto
@@ -454,6 +509,7 @@ class Registry(BaseRegistry):
                 return
         raise DataSourceNotFoundException(name)
 
+    @cas_retry
     def apply_feature_service(
         self, feature_service: FeatureService, project: str, commit: bool = True
     ):
@@ -742,6 +798,7 @@ class Registry(BaseRegistry):
         fv.current_version_number = version_number
         return fv
 
+    @cas_retry
     def apply_feature_view(
         self,
         feature_view: BaseFeatureView,
@@ -995,6 +1052,7 @@ class Registry(BaseRegistry):
         )
         return proto_registry_utils.get_label_view(registry_proto, name, project)
 
+    @cas_retry
     def delete_label_view(self, name: str, project: str, commit: bool = True):
         self._prepare_registry_for_changes(project)
         assert self.cached_registry_proto
@@ -1020,6 +1078,7 @@ class Registry(BaseRegistry):
         )
         return proto_registry_utils.get_data_source(registry_proto, name, project)
 
+    @cas_retry
     def apply_materialization(
         self,
         feature_view: Union[FeatureView, OnDemandFeatureView, LabelView],
@@ -1156,6 +1215,7 @@ class Registry(BaseRegistry):
             registry_proto, name, project
         )
 
+    @cas_retry
     def delete_feature_service(self, name: str, project: str, commit: bool = True):
         self._prepare_registry_for_changes(project)
         assert self.cached_registry_proto
@@ -1173,6 +1233,7 @@ class Registry(BaseRegistry):
                 return
         raise FeatureServiceNotFoundException(name, project)
 
+    @cas_retry
     def delete_feature_view(self, name: str, project: str, commit: bool = True):
         self._prepare_registry_for_changes(project)
         assert self.cached_registry_proto
@@ -1241,6 +1302,7 @@ class Registry(BaseRegistry):
         if commit:
             self.commit()
 
+    @cas_retry
     def delete_entity(self, name: str, project: str, commit: bool = True):
         self._prepare_registry_for_changes(project)
         assert self.cached_registry_proto
@@ -1259,6 +1321,7 @@ class Registry(BaseRegistry):
 
         raise EntityNotFoundException(name, project)
 
+    @cas_retry
     def apply_saved_dataset(
         self,
         saved_dataset: SavedDataset,
@@ -1327,6 +1390,7 @@ class Registry(BaseRegistry):
             collection=collection,
         )
 
+    @cas_retry
     def delete_saved_dataset(self, name: str, project: str, commit: bool = True):
         self._prepare_registry_for_changes(project)
         assert self.cached_registry_proto
@@ -1344,6 +1408,7 @@ class Registry(BaseRegistry):
                 return
         raise SavedDatasetNotFound(name, project=project)
 
+    @cas_retry
     def apply_validation_reference(
         self,
         validation_reference: ValidationReference,
@@ -1391,6 +1456,7 @@ class Registry(BaseRegistry):
             registry_proto, project, tags
         )
 
+    @cas_retry
     def delete_validation_reference(self, name: str, project: str, commit: bool = True):
         self._prepare_registry_for_changes(project)
         assert self.cached_registry_proto
@@ -1590,6 +1656,7 @@ class Registry(BaseRegistry):
         )
         return proto_registry_utils.list_permissions(registry_proto, project, tags)
 
+    @cas_retry
     def apply_permission(
         self, permission: Permission, project: str, commit: bool = True
     ):
@@ -1615,6 +1682,7 @@ class Registry(BaseRegistry):
         if commit:
             self.commit()
 
+    @cas_retry
     def delete_permission(self, name: str, project: str, commit: bool = True):
         self._prepare_registry_for_changes(project)
         assert self.cached_registry_proto
@@ -1630,6 +1698,7 @@ class Registry(BaseRegistry):
                 return
         raise PermissionNotFoundException(name, project)
 
+    @cas_retry
     def apply_project(
         self,
         project: Project,
@@ -1669,6 +1738,7 @@ class Registry(BaseRegistry):
             registry_proto=registry_proto, tags=tags
         )
 
+    @cas_retry
     def delete_project(
         self,
         name: str,
@@ -1720,86 +1790,3 @@ class Registry(BaseRegistry):
                     self.commit()
                 return
         raise ProjectNotFoundException(name)
-
-
-# ---------------------------------------------------------------------------
-# CAS retry support
-# ---------------------------------------------------------------------------
-# When the registry store is a CASS3RegistryStore, commit() may raise
-# RegistryCASConflictError (S3 412 PreconditionFailed). The cas_retry
-# decorator re-invokes the entire method so that _prepare_registry_for_changes
-# at the top of each method re-reads a fresh proto from S3, the mutation is
-# re-applied, and commit() retries with the new ETag.
-#
-# The mutations are idempotent: re-applying the same entity / FV / interval
-# to a fresh proto produces the correct state because the first write was
-# never persisted (that's why S3 returned 412).
-
-_CAS_MAX_RETRIES = 5
-_CAS_BASE_BACKOFF = 0.1
-_CAS_MAX_BACKOFF = 5.0
-
-F = TypeVar("F", bound=Callable[..., Any])
-
-
-def cas_retry(func: F) -> F:
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        for attempt in range(_CAS_MAX_RETRIES):
-            try:
-                return func(self, *args, **kwargs)
-            except RegistryCASConflictError:
-                if attempt < _CAS_MAX_RETRIES - 1:
-                    backoff = min(_CAS_BASE_BACKOFF * (2**attempt), _CAS_MAX_BACKOFF)
-                    logger.warning(
-                        "Registry CAS conflict on %s (attempt %d/%d), "
-                        "retrying in %.2fs",
-                        func.__name__,
-                        attempt + 1,
-                        _CAS_MAX_RETRIES,
-                        backoff,
-                    )
-                    time.sleep(backoff)
-                else:
-                    logger.error(
-                        "Registry CAS conflict on %s: max retries (%d) exceeded",
-                        func.__name__,
-                        _CAS_MAX_RETRIES,
-                    )
-                    raise
-        return None  # unreachable
-
-    return wrapper  # type: ignore[return-value]
-
-
-_REGISTRY_CAS_WRITE_METHODS = [
-    "update_infra",
-    "apply_entity",
-    "apply_data_source",
-    "delete_data_source",
-    "apply_feature_service",
-    "apply_feature_view",
-    "delete_label_view",
-    "apply_materialization",
-    "delete_feature_service",
-    "delete_feature_view",
-    "delete_entity",
-    "apply_saved_dataset",
-    "delete_saved_dataset",
-    "apply_validation_reference",
-    "delete_validation_reference",
-    "apply_permission",
-    "delete_permission",
-    "apply_project",
-    "delete_project",
-]
-
-
-def _apply_cas_retry_to_registry() -> None:
-    for method_name in _REGISTRY_CAS_WRITE_METHODS:
-        if hasattr(Registry, method_name):
-            original = getattr(Registry, method_name)
-            setattr(Registry, method_name, cas_retry(original))
-
-
-_apply_cas_retry_to_registry()
