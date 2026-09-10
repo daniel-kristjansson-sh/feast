@@ -74,7 +74,6 @@ REGISTRY_SCHEMA_VERSION = "1"
 REGISTRY_STORE_CLASS_FOR_TYPE = {
     "GCSRegistryStore": "feast.infra.registry.gcs.GCSRegistryStore",
     "S3RegistryStore": "feast.infra.registry.s3.S3RegistryStore",
-    "CASS3RegistryStore": "feast.infra.registry.cas_s3_registry_store.CASS3RegistryStore",
     "FileRegistryStore": "feast.infra.registry.file.FileRegistryStore",
     "AzureRegistryStore": "feast.infra.registry.contrib.azure.azure_registry_store.AzBlobRegistryStore",
     "HDFSRegistryStore": "feast.infra.registry.contrib.hdfs.hdfs_registry_store.HDFSRegistryStore",

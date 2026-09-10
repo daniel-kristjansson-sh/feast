@@ -3,29 +3,25 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from feast.errors import RegistryCASConflictError
-from feast.infra.registry.cas_s3_registry_store import CASS3RegistryStore
 from feast.infra.registry.registry import Registry, cas_retry
+from feast.infra.registry.s3 import S3RegistryStore
 from feast.protos.feast.core.Registry_pb2 import Registry as RegistryProto
 
 
-class TestCASS3RegistryStore:
-    """Tests for CASS3RegistryStore ETag capture and If-Match behavior."""
+class TestS3RegistryStoreCAS:
+    """Tests for S3RegistryStore ETag capture and If-Match behavior."""
 
     @pytest.fixture
     def mock_s3_store(self):
-        with patch(
-            "feast.infra.registry.cas_s3_registry_store.CASS3RegistryStore.__init__",
-            return_value=None,
-        ):
-            store = CASS3RegistryStore.__new__(CASS3RegistryStore)
-            store._bucket = "test-bucket"
-            store._key = "registry.db"
-            store._uri = MagicMock()
-            store._uri.geturl.return_value = "s3://test-bucket/registry.db"
-            store._boto_extra_args = {}
-            store._expected_etag = None
-            store.s3_client = MagicMock()
-            yield store
+        store = S3RegistryStore.__new__(S3RegistryStore)
+        store._bucket = "test-bucket"
+        store._key = "registry.db"
+        store._uri = MagicMock()
+        store._uri.geturl.return_value = "s3://test-bucket/registry.db"
+        store._boto_extra_args = {}
+        store._expected_etag = None
+        store.s3_client = MagicMock()
+        return store
 
     def test_get_registry_proto_captures_etag(self, mock_s3_store):
         proto = RegistryProto()

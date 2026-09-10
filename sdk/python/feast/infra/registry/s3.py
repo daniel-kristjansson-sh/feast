@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -6,7 +7,11 @@ from tempfile import TemporaryFile
 from typing import Optional
 from urllib.parse import urlparse
 
-from feast.errors import S3RegistryBucketForbiddenAccess, S3RegistryBucketNotExist
+from feast.errors import (
+    RegistryCASConflictError,
+    S3RegistryBucketForbiddenAccess,
+    S3RegistryBucketNotExist,
+)
 from feast.infra.registry.registry_store import RegistryStore
 from feast.protos.feast.core.Registry_pb2 import Registry as RegistryProto
 from feast.repo_config import RegistryConfig
@@ -19,28 +24,40 @@ except ImportError as e:
 
     raise FeastExtrasDependencyImportError("aws", str(e))
 
+try:
+    from botocore.exceptions import ClientError
+except ImportError as e:
+    from feast.errors import FeastExtrasDependencyImportError
+
+    raise FeastExtrasDependencyImportError("aws", str(e))
+
+logger = logging.getLogger(__name__)
+
 
 class S3RegistryStore(RegistryStore):
+    """S3 registry store with compare-and-swap (optimistic concurrency) support.
+
+    The store captures the S3 ETag on every read and passes it as ``IfMatch``
+    on every write, so S3 returns ``412 PreconditionFailed`` when another
+    process has written in between. On 412, :class:`RegistryCASConflictError`
+    is raised so callers can re-read, re-apply their mutation, and retry.
+    """
+
     def __init__(self, registry_config: RegistryConfig, repo_path: Path):
         uri = registry_config.path
         self._uri = urlparse(uri)
         self._bucket = self._uri.hostname
         self._key = self._uri.path.lstrip("/")
         self._boto_extra_args = registry_config.s3_additional_kwargs or {}
+        self._expected_etag: Optional[str] = None
 
         self.s3_client = boto3.resource(
             "s3", endpoint_url=os.environ.get("FEAST_S3_ENDPOINT_URL")
         )
 
-    def get_registry_proto(self):
+    def get_registry_proto(self) -> RegistryProto:
         file_obj = TemporaryFile()
         registry_proto = RegistryProto()
-        try:
-            from botocore.exceptions import ClientError
-        except ImportError as e:
-            from feast.errors import FeastExtrasDependencyImportError
-
-            raise FeastExtrasDependencyImportError("aws", str(e))
         try:
             bucket = self.s3_client.Bucket(self._bucket)
             self.s3_client.meta.client.head_bucket(Bucket=bucket.name)
@@ -54,8 +71,11 @@ class S3RegistryStore(RegistryStore):
                 raise S3RegistryBucketForbiddenAccess(self._bucket) from e
 
         try:
-            obj = bucket.Object(self._key)
-            obj.download_fileobj(file_obj)
+            response = self.s3_client.meta.client.get_object(
+                Bucket=self._bucket, Key=self._key
+            )
+            self._expected_etag = response.get("ETag", "").strip('"')
+            file_obj.write(response["Body"].read())
             file_obj.seek(0)
             registry_proto.ParseFromString(file_obj.read())
             return registry_proto
@@ -77,9 +97,26 @@ class S3RegistryStore(RegistryStore):
         file_obj = TemporaryFile()
         file_obj.write(registry_proto.SerializeToString())
         file_obj.seek(0)
-        self.s3_client.Bucket(self._bucket).put_object(
-            Body=file_obj, Key=self._key, **self._boto_extra_args
-        )
+
+        extra_args = dict(self._boto_extra_args)
+        if self._expected_etag:
+            extra_args["IfMatch"] = self._expected_etag
+
+        try:
+            response = self.s3_client.Bucket(self._bucket).put_object(
+                Body=file_obj, Key=self._key, **extra_args
+            )
+            if response is not None and response.e_tag:
+                self._expected_etag = response.e_tag.strip('"')
+        except ClientError as e:
+            error_code = int(e.response.get("Error", {}).get("Code", "0"))
+            if error_code == 412:
+                raise RegistryCASConflictError(
+                    f"Registry CAS conflict: another process modified the S3 "
+                    f"registry object at {self._uri.geturl()} between read "
+                    f"and write. Re-read and retry."
+                ) from e
+            raise
 
     def set_project_metadata(self, project: str, key: str, value: str):
         registry_proto = self.get_registry_proto()
