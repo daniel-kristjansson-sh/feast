@@ -10,6 +10,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictFloat,
     StrictInt,
     StrictStr,
     ValidationError,
@@ -202,6 +203,18 @@ class RegistryConfig(FeastBaseModel):
         (e.g., 'fv@v2:feature'). When True, each schema version gets its own
         online store table and can be queried independently. Version history
         tracking in the registry is always active regardless of this setting. """
+
+    cas_max_retries: StrictInt = 5
+    """int: Maximum number of CAS retry attempts on registry write conflicts
+    (S3 If-Match / GCS if_generation_match / Azure if_match 412 errors).
+    Set to 0 to disable retries (fail immediately on conflict)."""
+
+    cas_base_backoff_seconds: StrictFloat = 0.1
+    """float: Base backoff in seconds for CAS retry exponential backoff.
+    Actual backoff is min(base * 2^attempt, max_backoff_seconds)."""
+
+    cas_max_backoff_seconds: StrictFloat = 5.0
+    """float: Maximum backoff in seconds between CAS retries."""
 
     mcp: Optional[McpRegistryConfig] = None
     """ McpRegistryConfig: MCP (Model Context Protocol) configuration for the registry REST server. """

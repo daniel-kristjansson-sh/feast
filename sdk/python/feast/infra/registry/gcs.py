@@ -1,17 +1,34 @@
 import json
+import logging
 import uuid
 from pathlib import Path
 from tempfile import TemporaryFile
 from typing import Optional
 from urllib.parse import urlparse
 
+from feast.errors import RegistryCASConflictError
 from feast.infra.registry.registry_store import RegistryStore
 from feast.protos.feast.core.Registry_pb2 import Registry as RegistryProto
 from feast.repo_config import RegistryConfig
 from feast.utils import _utc_now
 
+logger = logging.getLogger(__name__)
+
+try:
+    from google.cloud.exceptions import PreconditionFailed as GCSPreconditionFailed
+except ImportError:
+    GCSPreconditionFailed = type("GCSPreconditionFailed", (Exception,), {})
+
 
 class GCSRegistryStore(RegistryStore):
+    """GCS registry store with compare-and-swap (optimistic concurrency) support.
+
+    Captures the blob generation on every read and passes it as
+    ``if_generation_match`` on every write, so GCS returns 412 when another
+    process has written in between. On conflict, raises
+    :class:`RegistryCASConflictError`.
+    """
+
     def __init__(self, registry_config: RegistryConfig, repo_path: Path):
         uri = registry_config.path
         try:
@@ -25,8 +42,9 @@ class GCSRegistryStore(RegistryStore):
         self._uri = urlparse(uri)
         self._bucket = self._uri.hostname
         self._blob = self._uri.path.lstrip("/")
+        self._expected_generation: Optional[int] = None
 
-    def get_registry_proto(self):
+    def get_registry_proto(self) -> RegistryProto:
         import google.cloud.storage as storage
         from google.cloud.exceptions import NotFound
 
@@ -38,10 +56,11 @@ class GCSRegistryStore(RegistryStore):
             raise Exception(
                 f"No bucket named {self._bucket} exists; please create it first."
             )
-        if storage.Blob(bucket=bucket, name=self._blob).exists(self.gcs_client):
-            self.gcs_client.download_blob_to_file(
-                self._uri.geturl(), file_obj, timeout=30
-            )
+        blob = storage.Blob(bucket=bucket, name=self._blob)
+        if blob.exists(self.gcs_client):
+            blob.reload(self.gcs_client)
+            self._expected_generation = blob.generation
+            blob.download_to_file(file_obj)
             file_obj.seek(0)
             registry_proto.ParseFromString(file_obj.read())
             return registry_proto
@@ -59,19 +78,28 @@ class GCSRegistryStore(RegistryStore):
         try:
             gs_bucket.delete_blob(self._blob)
         except NotFound:
-            # If the blob deletion fails with NotFound, it has already been deleted.
             pass
 
     def _write_registry(self, registry_proto: RegistryProto):
         registry_proto.version_id = str(uuid.uuid4())
         registry_proto.last_updated.FromDatetime(_utc_now())
-        # we have already checked the bucket exists so no need to do it again
         gs_bucket = self.gcs_client.get_bucket(self._bucket)
         blob = gs_bucket.blob(self._blob)
         file_obj = TemporaryFile()
         file_obj.write(registry_proto.SerializeToString())
         file_obj.seek(0)
-        blob.upload_from_file(file_obj)
+        try:
+            blob.upload_from_file(
+                file_obj, if_generation_match=self._expected_generation
+            )
+            blob.reload(self.gcs_client)
+            self._expected_generation = blob.generation
+        except GCSPreconditionFailed as e:
+            raise RegistryCASConflictError(
+                f"Registry CAS conflict: another process modified the GCS "
+                f"registry object at {self._uri.geturl()} between read "
+                f"and write. Re-read and retry."
+            ) from e
 
     def set_project_metadata(self, project: str, key: str, value: str):
         registry_proto = self.get_registry_proto()
