@@ -67,6 +67,7 @@ from feast.errors import (
     DataSourceRepeatNamesException,
     FeatureViewNotFoundException,
     PushSourceNotFoundException,
+    RegistryCASConflictError,
     RequestDataNotFoundInEntityDfException,
 )
 from feast.feast_object import FeastObject
@@ -5089,3 +5090,47 @@ def _validate_data_sources(data_sources: List[DataSource]):
             raise DataSourceRepeatNamesException(case_insensitive_ds_name)
         else:
             ds_names.add(case_insensitive_ds_name)
+
+
+# ---------------------------------------------------------------------------
+# CAS retry for FeatureStore.apply
+# ---------------------------------------------------------------------------
+# apply() calls many registry.apply_* with commit=False, then a single
+# registry.commit(). The individual apply_* methods are already wrapped with
+# cas_retry, but since they pass commit=False, the CAS conflict can only
+# surface on the final commit(). That commit has no mutation to replay, so
+# the entire apply sequence must be re-run on conflict. All operations are
+# idempotent, so this is safe.
+
+_CAS_MAX_RETRIES = 5
+_CAS_BASE_BACKOFF = 0.1
+_CAS_MAX_BACKOFF = 5.0
+
+_apply_original = FeatureStore.apply
+
+
+def _apply_with_cas_retry(self, *args, **kwargs):
+    for attempt in range(_CAS_MAX_RETRIES):
+        try:
+            return _apply_original(self, *args, **kwargs)
+        except RegistryCASConflictError:
+            if attempt < _CAS_MAX_RETRIES - 1:
+                backoff = min(_CAS_BASE_BACKOFF * (2**attempt), _CAS_MAX_BACKOFF)
+                _logger.warning(
+                    "Registry CAS conflict during apply (attempt %d/%d), "
+                    "retrying in %.2fs",
+                    attempt + 1,
+                    _CAS_MAX_RETRIES,
+                    backoff,
+                )
+                time.sleep(backoff)
+            else:
+                _logger.error(
+                    "Registry CAS conflict during apply: max retries (%d) exceeded",
+                    _CAS_MAX_RETRIES,
+                )
+                raise
+    return None  # unreachable
+
+
+FeatureStore.apply = _apply_with_cas_retry

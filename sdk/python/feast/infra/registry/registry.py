@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import wraps
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, TypeVar, Union
 from urllib.parse import urlparse
 
 from google.protobuf.duration_pb2 import Duration
@@ -37,6 +39,7 @@ from feast.errors import (
     PermissionNotFoundException,
     ProjectNotFoundException,
     ProjectObjectNotFoundException,
+    RegistryCASConflictError,
     SavedDatasetNotFound,
     ValidationReferenceNotFound,
 )
@@ -71,6 +74,7 @@ REGISTRY_SCHEMA_VERSION = "1"
 REGISTRY_STORE_CLASS_FOR_TYPE = {
     "GCSRegistryStore": "feast.infra.registry.gcs.GCSRegistryStore",
     "S3RegistryStore": "feast.infra.registry.s3.S3RegistryStore",
+    "CASS3RegistryStore": "feast.infra.registry.cas_s3_registry_store.CASS3RegistryStore",
     "FileRegistryStore": "feast.infra.registry.file.FileRegistryStore",
     "AzureRegistryStore": "feast.infra.registry.contrib.azure.azure_registry_store.AzBlobRegistryStore",
     "HDFSRegistryStore": "feast.infra.registry.contrib.hdfs.hdfs_registry_store.HDFSRegistryStore",
@@ -1717,3 +1721,86 @@ class Registry(BaseRegistry):
                     self.commit()
                 return
         raise ProjectNotFoundException(name)
+
+
+# ---------------------------------------------------------------------------
+# CAS retry support
+# ---------------------------------------------------------------------------
+# When the registry store is a CASS3RegistryStore, commit() may raise
+# RegistryCASConflictError (S3 412 PreconditionFailed). The cas_retry
+# decorator re-invokes the entire method so that _prepare_registry_for_changes
+# at the top of each method re-reads a fresh proto from S3, the mutation is
+# re-applied, and commit() retries with the new ETag.
+#
+# The mutations are idempotent: re-applying the same entity / FV / interval
+# to a fresh proto produces the correct state because the first write was
+# never persisted (that's why S3 returned 412).
+
+_CAS_MAX_RETRIES = 5
+_CAS_BASE_BACKOFF = 0.1
+_CAS_MAX_BACKOFF = 5.0
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def cas_retry(func: F) -> F:
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        for attempt in range(_CAS_MAX_RETRIES):
+            try:
+                return func(self, *args, **kwargs)
+            except RegistryCASConflictError:
+                if attempt < _CAS_MAX_RETRIES - 1:
+                    backoff = min(_CAS_BASE_BACKOFF * (2**attempt), _CAS_MAX_BACKOFF)
+                    logger.warning(
+                        "Registry CAS conflict on %s (attempt %d/%d), "
+                        "retrying in %.2fs",
+                        func.__name__,
+                        attempt + 1,
+                        _CAS_MAX_RETRIES,
+                        backoff,
+                    )
+                    time.sleep(backoff)
+                else:
+                    logger.error(
+                        "Registry CAS conflict on %s: max retries (%d) exceeded",
+                        func.__name__,
+                        _CAS_MAX_RETRIES,
+                    )
+                    raise
+        return None  # unreachable
+
+    return wrapper  # type: ignore[return-value]
+
+
+_REGISTRY_CAS_WRITE_METHODS = [
+    "update_infra",
+    "apply_entity",
+    "apply_data_source",
+    "delete_data_source",
+    "apply_feature_service",
+    "apply_feature_view",
+    "delete_label_view",
+    "apply_materialization",
+    "delete_feature_service",
+    "delete_feature_view",
+    "delete_entity",
+    "apply_saved_dataset",
+    "delete_saved_dataset",
+    "apply_validation_reference",
+    "delete_validation_reference",
+    "apply_permission",
+    "delete_permission",
+    "apply_project",
+    "delete_project",
+]
+
+
+def _apply_cas_retry_to_registry() -> None:
+    for method_name in _REGISTRY_CAS_WRITE_METHODS:
+        if hasattr(Registry, method_name):
+            original = getattr(Registry, method_name)
+            setattr(Registry, method_name, cas_retry(original))
+
+
+_apply_cas_retry_to_registry()
