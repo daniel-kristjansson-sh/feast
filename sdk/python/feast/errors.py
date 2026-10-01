@@ -160,6 +160,18 @@ class ConcurrentVersionConflict(FeastError):
         super().__init__(msg)
 
 
+class RegistryCASConflictError(FeastError):
+    """Raised when an S3 conditional write (If-Match) fails because another
+    process modified the registry object between read and write.
+
+    Callers should catch this, re-read the registry, re-apply their mutation,
+    and retry the commit.
+    """
+
+    def __init__(self, msg: str):
+        super().__init__(msg)
+
+
 class OnDemandFeatureViewNotFoundException(FeastObjectNotFoundException):
     def __init__(self, name, project=None):
         if project:

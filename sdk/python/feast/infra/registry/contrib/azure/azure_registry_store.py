@@ -2,6 +2,7 @@
 # Licensed under the MIT license.
 
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -9,6 +10,7 @@ from tempfile import TemporaryFile
 from typing import Optional
 from urllib.parse import urlparse
 
+from feast.errors import RegistryCASConflictError
 from feast.infra.registry.registry import RegistryConfig
 from feast.infra.registry.registry_store import RegistryStore
 from feast.protos.feast.core.Registry_pb2 import Registry as RegistryProto
@@ -16,12 +18,24 @@ from feast.utils import _utc_now
 
 REGISTRY_SCHEMA_VERSION = "1"
 
+logger = logging.getLogger(__name__)
+
+try:
+    from azure.core.exceptions import ResourceModifiedError
+except ImportError:
+    ResourceModifiedError = type("ResourceModifiedError", (Exception,), {})
+
 
 class AzBlobRegistryStore(RegistryStore):
+    """Azure Blob Storage registry store with compare-and-swap support.
+
+    Captures the blob ETag on every read and passes it as ``if_match`` on
+    every write, so Azure returns 412 when another process has written in
+    between. On conflict, raises :class:`RegistryCASConflictError`.
+    """
+
     def __init__(self, registry_config: RegistryConfig, repo_path: Path):
         try:
-            import logging
-
             from azure.identity import DefaultAzureCredential
             from azure.storage.blob import BlobServiceClient
         except ImportError as e:
@@ -34,48 +48,44 @@ class AzBlobRegistryStore(RegistryStore):
         container_path = self._uri.path.lstrip("/").split("/")
         self._container = container_path.pop(0)
         self._path = "/".join(container_path)
+        self._expected_etag: Optional[str] = None
 
         try:
-            # turn the verbosity of the blob client to warning and above (this reduces verbosity)
-            logger = logging.getLogger("azure")
-            logger.setLevel(logging.ERROR)
+            azure_logger = logging.getLogger("azure")
+            azure_logger.setLevel(logging.ERROR)
 
-            # Attempt to use shared account key to login first
             if "REGISTRY_BLOB_KEY" in os.environ:
                 client = BlobServiceClient(
                     account_url=self._account_url,
                     credential=os.environ["REGISTRY_BLOB_KEY"],
                 )
-                self.blob = client.get_blob_client(
-                    container=self._container, blob=self._path
+            else:
+                default_credential = DefaultAzureCredential(
+                    exclude_shared_token_cache_credential=True
                 )
-                return
-
-            default_credential = DefaultAzureCredential(
-                exclude_shared_token_cache_credential=True
-            )
-
-            client = BlobServiceClient(
-                account_url=self._account_url, credential=default_credential
-            )
+                client = BlobServiceClient(
+                    account_url=self._account_url, credential=default_credential
+                )
             self.blob = client.get_blob_client(
                 container=self._container, blob=self._path
             )
         except Exception as e:
-            print(
-                f"Could not connect to blob. Check the following\nIs the URL specified correctly?\nIs you IAM role set to Storage Blob Data Contributor? \n Errored out with exception {e}"
+            logger.error(
+                "Could not connect to blob. Check the following: "
+                "Is the URL specified correctly? "
+                "Is your IAM role set to Storage Blob Data Contributor? "
+                "Error: %s",
+                e,
             )
 
-        return
-
-    def get_registry_proto(self):
+    def get_registry_proto(self) -> RegistryProto:
         file_obj = TemporaryFile()
         registry_proto = RegistryProto()
 
         if self.blob.exists():
             download_stream = self.blob.download_blob()
+            self._expected_etag = download_stream.properties.etag
             file_obj.write(download_stream.readall())
-
             file_obj.seek(0)
             registry_proto.ParseFromString(file_obj.read())
             return registry_proto
@@ -96,8 +106,17 @@ class AzBlobRegistryStore(RegistryStore):
         file_obj = TemporaryFile()
         file_obj.write(registry_proto.SerializeToString())
         file_obj.seek(0)
-        self.blob.upload_blob(file_obj, overwrite=True)  # type: ignore
-        return
+        try:
+            uploaded = self.blob.upload_blob(
+                file_obj, overwrite=True, if_match=self._expected_etag
+            )
+            self._expected_etag = uploaded.etag
+        except ResourceModifiedError as e:
+            raise RegistryCASConflictError(
+                f"Registry CAS conflict: another process modified the Azure "
+                f"blob registry object at {self._uri.geturl()} between read "
+                f"and write. Re-read and retry."
+            ) from e
 
     def set_project_metadata(self, project: str, key: str, value: str):
         registry_proto = self.get_registry_proto()
