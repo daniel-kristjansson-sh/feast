@@ -9,6 +9,7 @@ still returned.
 
 import os
 from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -172,9 +173,7 @@ def test_pruning_upper_bound_keeps_sub_microsecond_matches():
         entity_df = pd.DataFrame(
             {
                 "driver_id": [1],
-                "event_timestamp": pd.to_datetime(
-                    ["2024-06-01 00:00:00.123456789"]
-                ),
+                "event_timestamp": pd.to_datetime(["2024-06-01 00:00:00.123456789"]),
             }
         )
         assert entity_df["event_timestamp"].iloc[0].nanosecond == 789
@@ -196,6 +195,10 @@ def test_pruning_lower_bound_uses_utc_elapsed_time_across_dst():
     ZoneInfo. Subtracting the TTL from that datetime does wall-clock arithmetic,
     so across a spring-forward transition the Python cutoff lands one hour later
     in UTC than the per-row TTL. A feature inside the TTL must not be pruned.
+
+    The timezone must be a ZoneInfo, not a tz string: pandas 2.x resolves strings
+    to pytz, whose localized datetimes carry a fixed offset and so already
+    subtract elapsed time, hiding the bug.
 
     Entity at noon America/New_York on 2025-03-09 is 16:00 UTC. A 24h TTL keeps
     16:30 UTC on 2025-03-08, but wall-clock subtraction produces 17:00 UTC.
@@ -226,7 +229,11 @@ def test_pruning_lower_bound_uses_utc_elapsed_time_across_dst():
             {
                 "driver_id": [1],
                 "event_timestamp": pd.Series(
-                    [pd.Timestamp("2025-03-09 12:00:00", tz="America/New_York")]
+                    [
+                        pd.Timestamp(
+                            "2025-03-09 12:00:00", tz=ZoneInfo("America/New_York")
+                        )
+                    ]
                 ),
             }
         )
