@@ -1,20 +1,23 @@
 import re
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 from pytest_mock import MockFixture
 
-from feast import FeatureView, Field, FileSource
+from feast import Entity, FeatureView, Field, FileSource
 from feast.infra.offline_stores.snowflake import (
+    SnowflakeOfflineStore,
     SnowflakeOfflineStoreConfig,
     SnowflakeRetrievalJob,
 )
 from feast.infra.offline_stores.snowflake_source import SnowflakeSource
 from feast.infra.online_stores.sqlite import SqliteOnlineStoreConfig
 from feast.repo_config import RepoConfig
-from feast.types import Array, String
+from feast.types import Array, Float32, Int64, String
 
 
 @pytest.fixture(params=["s3", "s3gov"])
@@ -137,3 +140,124 @@ def test_snowflake_source_integer_column_types(
     )
 
     assert list(source.get_table_column_names_and_types(config)) == [("ID", expected)]
+
+
+# Feature-table pruning bounds in the point-in-time join.
+#
+# The "__subquery" CTE filters the feature table by
+#   timestamp_field <= max_event_timestamp
+#   timestamp_field >= min_event_timestamp   (only when the view has a TTL)
+# These predicates may only drop rows that the ASOF join and per-row TTL filter
+# would discard anyway. The integration tests in
+# tests/integration/offline_store/test_snowflake_pruning.py check the end-to-end
+# result; these check the rendered bounds without a Snowflake account.
+
+_PRUNING_UPPER_BOUND = re.compile(r"\"event_timestamp\" <= TIMESTAMP '([^']+)'")
+_PRUNING_LOWER_BOUND = re.compile(r"\"event_timestamp\" >= TIMESTAMP '([^']+)'")
+
+
+def _pruning_bounds(entity_df: pd.DataFrame, ttl: timedelta):
+    """Render the point-in-time SQL and return its (lower, upper) pruning bounds."""
+    driver = Entity(name="driver", join_keys=["driver_id"])
+    feature_view = FeatureView(
+        name="driver_fv",
+        entities=[driver],
+        ttl=ttl,
+        schema=[
+            Field(name="driver_id", dtype=Int64),
+            Field(name="value", dtype=Float32),
+        ],
+        source=SnowflakeSource(
+            database="FEAST",
+            schema="PUBLIC",
+            table="DRIVER_FEATURES",
+            timestamp_field="event_timestamp",
+        ),
+    )
+    config = RepoConfig(
+        registry="s3://ml-test/repo/registry.db",
+        project="test",
+        provider="local",
+        online_store=SqliteOnlineStoreConfig(type="sqlite"),
+        offline_store=SnowflakeOfflineStoreConfig(
+            type="snowflake.offline",
+            account="snow",
+            user="snow",
+            password="snow",
+            role="snow",
+            warehouse="snow",
+            database="FEAST",
+            schema="OFFLINE",
+        ),
+        entity_key_serialization_version=3,
+    )
+    registry = MagicMock()
+    registry.list_on_demand_feature_views.return_value = []
+
+    with (
+        patch("feast.infra.offline_stores.snowflake.GetSnowflakeConnection"),
+        patch("feast.infra.offline_stores.snowflake._upload_entity_df"),
+    ):
+        job = SnowflakeOfflineStore.get_historical_features(
+            config=config,
+            feature_views=[feature_view],
+            feature_refs=["driver_fv:value"],
+            entity_df=entity_df,
+            registry=registry,
+            project="test",
+        )
+        with job._query_generator() as query:
+            sql = query
+
+    lower = _PRUNING_LOWER_BOUND.search(sql)
+    upper = _PRUNING_UPPER_BOUND.search(sql)
+    assert upper is not None, sql
+    return (
+        pd.Timestamp(lower.group(1)) if lower else None,
+        pd.Timestamp(upper.group(1)),
+    )
+
+
+def test_pruning_upper_bound_keeps_sub_microsecond_entity_timestamps():
+    """to_pydatetime() drops nanoseconds from the entity maximum.
+
+    The uploaded entity row keeps them, so a feature in the same microsecond is
+    still eligible for the ASOF join. The upper bound must not fall below the
+    full-precision entity timestamp.
+    """
+    entity_ts = pd.Timestamp("2024-06-01 00:00:00.123456789")
+    entity_df = pd.DataFrame({"driver_id": [1], "event_timestamp": [entity_ts]})
+
+    _, upper = _pruning_bounds(entity_df, ttl=timedelta(0))
+
+    assert upper >= entity_ts
+
+
+def test_pruning_lower_bound_uses_utc_elapsed_time_across_dst():
+    """With coerce_tz_aware disabled the TTL must be elapsed time, not wall-clock.
+
+    Noon America/New_York on 2025-03-09 is 16:00 UTC, the day of the
+    spring-forward transition. The per-row TTL in SQL subtracts 86400 seconds,
+    so 16:00 UTC on 2025-03-08 is eligible. Subtracting timedelta(days=1) from a
+    ZoneInfo datetime is wall-clock arithmetic and yields 17:00 UTC, pruning
+    eligible features between 16:00 and 17:00 UTC.
+
+    The timezone must be a ZoneInfo: pandas 2.x resolves tz strings to pytz,
+    whose localized datetimes carry a fixed offset and hide the bug.
+    """
+    entity_df = pd.DataFrame(
+        {
+            "driver_id": [1],
+            "event_timestamp": pd.Series(
+                [pd.Timestamp("2025-03-09 12:00:00", tz=ZoneInfo("America/New_York"))]
+            ),
+        }
+    )
+    assert isinstance(
+        entity_df["event_timestamp"].min().to_pydatetime().tzinfo, ZoneInfo
+    )
+
+    lower, _ = _pruning_bounds(entity_df, ttl=timedelta(days=1))
+
+    assert lower is not None
+    assert lower <= pd.Timestamp("2025-03-08 16:00:00")
