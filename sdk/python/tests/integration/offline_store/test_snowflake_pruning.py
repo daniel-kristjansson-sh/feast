@@ -140,6 +140,55 @@ def test_pruning_upper_bound_uses_uploaded_entity_snapshot():
         environment.teardown()
 
 
+def test_pruning_upper_bound_keeps_sub_microsecond_matches():
+    """The upper bound must not truncate sub-microsecond entity timestamps.
+
+    pandas loses nanosecond digits when the entity timestamp is converted with
+    to_pydatetime(), while the uploaded entity row and the feature table keep
+    them. A feature in the same microsecond as the latest entity timestamp is
+    still eligible for the ASOF join and must survive pruning.
+    """
+    environment = _make_environment()
+    environment.setup()
+    store = environment.feature_store
+    try:
+        feature_table = _create_table(
+            environment,
+            "sub_microsecond_features",
+            '"driver_id" INT, "event_timestamp" TIMESTAMP_NTZ(9), "value" FLOAT',
+        )
+        _execute(
+            environment,
+            f'INSERT INTO "{feature_table}" VALUES '
+            "(1, TIMESTAMP '2024-06-01 00:00:00.123456700', 42.0)",
+        )
+
+        driver = Entity(name="driver", join_keys=["driver_id"])
+        feature_view = _driver_view(
+            "sub_microsecond_fv", _feature_source(feature_table)
+        )
+        store.apply([driver, feature_view])
+
+        entity_df = pd.DataFrame(
+            {
+                "driver_id": [1],
+                "event_timestamp": pd.to_datetime(
+                    ["2024-06-01 00:00:00.123456789"]
+                ),
+            }
+        )
+        assert entity_df["event_timestamp"].iloc[0].nanosecond == 789
+
+        df = store.get_historical_features(
+            entity_df=entity_df,
+            features=["sub_microsecond_fv:value"],
+        ).to_df()
+
+        assert df["value"].iloc[0] == 42.0
+    finally:
+        environment.teardown()
+
+
 def test_pruning_lower_bound_uses_utc_elapsed_time_across_dst():
     """The TTL lower bound is elapsed time, not wall-clock time.
 
